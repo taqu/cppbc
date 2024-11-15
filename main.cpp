@@ -1,0 +1,91 @@
+#include <stdlib.h>
+#include "cppbc.h"
+#include <lodepng.h>
+#include <bc7decomp.h>
+#include <bc7enc.h>
+
+namespace
+{
+void extract(cppbc::u8 block[16 * 4], cppbc::u32 x, cppbc::u32 y, cppbc::u32 w, cppbc::u32 h, const cppbc::u8* src)
+{
+	using namespace cppbc;
+	src += (w*y + x)*4;
+	for(u32 i=0; i<4; ++i){
+		for(u32 j=0; j<4; ++j){
+			u32 d = (i*4+j)*4;
+			u32 s = (i*w+j)*4;
+            block[d + 0] = src[s + 0];
+            block[d + 1] = src[s + 1];
+            block[d + 2] = src[s + 2];
+            block[d + 3] = src[s + 3];
+        }
+	}
+}
+
+void inject(cppbc::u8* dst, cppbc::u32 x, cppbc::u32 y, cppbc::u32 w, cppbc::u32 h, const cppbc::u8 block[16 * 4])
+{
+	using namespace cppbc;
+	dst += (w*y + x)*4;
+	for(u32 i=0; i<4; ++i){
+		for(u32 j=0; j<4; ++j){
+			u32 d = (i*w+j)*4;
+			u32 s = (i*4+j)*4;
+            dst[d + 0] = block[s + 0];
+            dst[d + 1] = block[s + 1];
+            dst[d + 2] = block[s + 2];
+            dst[d + 3] = block[s + 3];
+        }
+	}
+}
+
+void proc(const char* file, cppbc::u32 no)
+{
+	using namespace cppbc;
+	cppbc::u8* out = nullptr;
+	u32 width = 0;
+	u32 height = 0;
+	u32 size = lodepng_decode32_file(&out, &width, &height, file);
+
+	u32 wblocks = width / 4;
+    u32 hblocks = height / 4;
+    u8* blocks = (u8*)malloc(16 * wblocks * hblocks);
+	u8 block[16*4];
+    {
+        bc7enc_compress_block_init();
+        bc7enc_compress_block_params params;
+        bc7enc_compress_block_params_init(&params);
+        for(u32 i = 0; i < hblocks; ++i) {
+            for(u32 j = 0; j < wblocks; ++j) {
+				extract(block, j*4, i*4, width, height, out);
+                u8* b = blocks + ((i * wblocks) + j) * 16;
+                bc7enc_compress_block(b, block, &params);
+            }
+        }
+        free(out);
+    }
+
+	u8* out2 = (u8*)malloc(width*height*4);
+	{
+		for(u32 i=0; i<hblocks; ++i){
+			for(u32 j=0; j<wblocks; ++j){
+				const u8* b = blocks + ((i*wblocks) + j)*16;
+				bool r = bc7decomp::unpack_bc7(b, (bc7decomp::color_rgba*)block);
+				assert(r);
+				inject(out2, j*4, i*4, width, height, block);
+			}
+		}
+		free(blocks);
+    }
+
+	char buffer[64];
+	sprintf_s(buffer, "out%02d.png", no);
+	lodepng_encode32_file(buffer, out2, width, height);
+	free(out2);
+}
+}
+
+int main(void)
+{
+	proc("data/00077-1276808498.png", 0);
+	return 0;
+}

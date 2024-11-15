@@ -8,13 +8,22 @@ project(${PROJECT_NAME})
 set(PROJECT_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(AFTER ${PROJECT_ROOT})
 
+set(BC7ENC_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/bc7enc)
+include_directories(AFTER ${BC7ENC_ROOT})
+
 ########################################################################
 # Sources
 set(HEADERS
-    "${PROJECT_ROOT}/cppbc.h")
+    ${PROJECT_ROOT}/cppbc.h
+    ${BC7ENC_ROOT}/bc7enc.h
+    ${BC7ENC_ROOT}/bc7decomp.h
+    ${BC7ENC_ROOT}/lodepng.h)
 
 set(SOURCES
-    "${PROJECT_ROOT}/cppbc.cpp")
+    ${PROJECT_ROOT}/cppbc.cpp
+    ${BC7ENC_ROOT}/bc7enc.c
+    ${BC7ENC_ROOT}/bc7decomp.cpp
+    ${BC7ENC_ROOT}/lodepng.cpp)
 
 source_group("include" FILES ${HEADERS})
 source_group("src" FILES ${SOURCES} "${PROJECT_ROOT}/main.cpp")
@@ -38,12 +47,12 @@ if(MSVC)
     set(CMAKE_CXX_FLAGS "${DEFAULT_CXX_FLAGS}")
     set(CMAKE_CXX_FLAGS_DEBUG "/D_DEBUG /MTd /Zi /Ob0 /Od /RTC1 /Gy /GR /GS /Gm- /EHsc")
     set(CMAKE_CXX_FLAGS_RELEASE "/MT /O2 /Oi /GL /GR /DNDEBUG /EHsc-")
-    target_link_libraries(${PROJECT_NAME} MIMALLOC ONIGURUMA OPENCL)
+    target_link_libraries(${PROJECT_NAME})
 
 elseif(UNIX)
     set(DEFAULT_CXX_FLAGS "-Wall -O2 -std=c++20 -std=gnu++20 -march=x86-64-v3 -fno-exceptions")
     set(CMAKE_CXX_FLAGS "${DEFAULT_CXX_FLAGS}")
-    target_link_libraries(${PROJECT_NAME} MIMALLOC ONIGURUMA OPENCL)
+    target_link_libraries(${PROJECT_NAME})
 elseif(APPLE)
 elseif(APPLE)
 endif()
