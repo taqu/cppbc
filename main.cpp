@@ -6,7 +6,7 @@
 
 namespace
 {
-void extract(cppbc::u8 block[16 * 4], cppbc::u32 x, cppbc::u32 y, cppbc::u32 w, cppbc::u32 h, const cppbc::u8* src)
+void extract(cppbc::u8 block[16 * 4], cppbc::u32 x, cppbc::u32 y, cppbc::u32 w, cppbc::u32 /*h*/, const cppbc::u8* src)
 {
 	using namespace cppbc;
 	src += (w*y + x)*4;
@@ -65,6 +65,7 @@ void proc(const char* file, cppbc::u32 no)
     }
 
 	u8* out2 = (u8*)malloc(width*height*4);
+	u8* out3 = (u8*)malloc(width*height*4);
 	{
 		for(u32 i=0; i<hblocks; ++i){
 			for(u32 j=0; j<wblocks; ++j){
@@ -72,20 +73,29 @@ void proc(const char* file, cppbc::u32 no)
 				bool r = bc7decomp::unpack_bc7(b, (bc7decomp::color_rgba*)block);
 				assert(r);
 				inject(out2, j*4, i*4, width, height, block);
+
+				cppbc::bc7_decode_block(block, (const u8*)b);
+				assert(r);
+				inject(out3, j*4, i*4, width, height, block);
 			}
 		}
 		free(blocks);
     }
 
 	char buffer[64];
-	sprintf_s(buffer, "out%02d.png", no);
+	sprintf_s(buffer, "out1_%02d.png", no);
 	lodepng_encode32_file(buffer, out2, width, height);
+	sprintf_s(buffer, "out2_%02d.png", no);
+	lodepng_encode32_file(buffer, out3, width, height);
 	free(out2);
+	free(out3);
 }
 }
 
 int main(void)
 {
 	proc("data/00077-1276808498.png", 0);
+	proc("data/00089-1165941666.png", 1);
+	proc("data/00137-1892423318.png", 2);
 	return 0;
 }
