@@ -60,8 +60,8 @@ void proc(const char* file, cppbc::u32 no)
             for(u32 j = 0; j < wblocks; ++j) {
 				extract(block, j*4, i*4, width, height, out);
                 u8* b = blocks + ((i * wblocks) + j) * 16;
-                //bc7enc_compress_block(b, block, &params);
-				cppbc::bc7_encode_block(b, params1, block);
+                bc7enc_compress_block(b, block, &params);
+				//cppbc::bc7_encode_block(b, params1, block);
             }
         }
         free(out);
