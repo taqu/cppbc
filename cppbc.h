@@ -19,10 +19,11 @@ namespace cppbc
 
 struct bc7param
 {
+	u8 max_alpha_ = 255;
 };
 
-void bc7_encode_block(u8 dst[16], const bc7param& param, const u8 src[64]);
 void bc7_decode_block(u8 dst[64], const u8 src[16]);
+void bc7_encode_block(u8 dst[16], const bc7param& param, const u8 src[64]);
 } // namespace cppbc
 #endif //INC_CPPBC_H_
 

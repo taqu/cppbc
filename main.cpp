@@ -54,11 +54,14 @@ void proc(const char* file, cppbc::u32 no)
         bc7enc_compress_block_init();
         bc7enc_compress_block_params params;
         bc7enc_compress_block_params_init(&params);
+
+		cppbc::bc7param params1;
         for(u32 i = 0; i < hblocks; ++i) {
             for(u32 j = 0; j < wblocks; ++j) {
 				extract(block, j*4, i*4, width, height, out);
                 u8* b = blocks + ((i * wblocks) + j) * 16;
-                bc7enc_compress_block(b, block, &params);
+                //bc7enc_compress_block(b, block, &params);
+				cppbc::bc7_encode_block(b, params1, block);
             }
         }
         free(out);
@@ -94,8 +97,8 @@ void proc(const char* file, cppbc::u32 no)
 
 int main(void)
 {
-	proc("data/00077-1276808498.png", 0);
-	proc("data/00089-1165941666.png", 1);
-	proc("data/00137-1892423318.png", 2);
+	proc("data/cat00.png", 0);
+	proc("data/cat01.png", 1);
+	proc("data/cat02.png", 2);
 	return 0;
 }
