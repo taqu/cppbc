@@ -214,8 +214,13 @@ namespace
         15, 3,15,15,15,15,15,15,
         15,15,15,15, 3,15,15, 8,
     };
+
+    const u16 aWeights2[] = {0, 21, 43, 64};
+    const u16 aWeights3[] = {0, 9, 18, 27, 37, 46, 55, 64};
+    const u16 aWeights4[] = {0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64};
     // clang-format on
 
+    u8 interpolate(u8 e0, u8 e1, u8 index, u8 index_bits);
 
     struct RGBA
     {
@@ -383,12 +388,24 @@ namespace
 
     struct CompressionStatus
     {
+        u32 mode_;
+        u8 color_bits_;
+        u8 index_bits_;
+        bool has_alpha_;
+        bool has_pbits_;
+        bool share_pbits_;
+        u32 num_pixels_;
+        RGBA pixels_[16];
+    };
+
+    struct CompressionResult
+    {
         u64 error_;
         RGBA low_endpoint_;
         RGBA high_endpoint_;
-        u32 pbits_[2];
-        u32 indices_[16];
-        u32 alpha_indices_[16];
+        u8 pbits_[2];
+        u8 indices_[16];
+        u8 alpha_indices_[16];
     };
 
     /**
@@ -421,7 +438,28 @@ namespace
     /**
      * @brief Kahan's summation
      */
-    void kahan(f32 covariance[16], u32 size, const FRGBA* points, const FRGBA& average)
+    void kahan_rgb(f32 covariance[9], u32 size, const FRGBA* points, const FRGBA& average)
+    {
+        f32 errors[6] = {};
+        for(u32 i = 0; i < size; ++i) {
+            f32 dr = points[i].r_ - average.r_;
+            f32 dg = points[i].g_ - average.g_;
+            f32 db = points[i].b_ - average.b_;
+            kahan(&covariance[0], &errors[0], dr * dr);
+            kahan(&covariance[1], &errors[1], dr * dg);
+            kahan(&covariance[2], &errors[2], dr * db);
+
+            kahan(&covariance[4], &errors[3], dg * dg);
+            kahan(&covariance[5], &errors[4], dg * db);
+
+            kahan(&covariance[8], &errors[5], db * db);
+        }
+    }
+
+    /**
+     * @brief Kahan's summation
+     */
+    void kahan_rgba(f32 covariance[16], u32 size, const FRGBA* points, const FRGBA& average)
     {
         f32 errors[10] = {};
         for(u32 i = 0; i < size; ++i) {
@@ -498,9 +536,9 @@ namespace
         m[k * 3 + l] = t0 * sn + t1 * cs;
     }
 
-    bool jacobi9(f32 M[9], f32 N[9])
+    bool jacobi(f32* M, f32* N, u32 size)
     {
-        static constexpr u32 Size = 3;
+        const u32 Size = size;
         static constexpr u32 MaxIteration = 100;
         ::memset(N, 0, sizeof(f32) * 9);
         f32 cs;
@@ -521,7 +559,7 @@ namespace
             offdiag = 0.0f;
             for(u32 i = 0; i < Size - 1; ++i) {
                 for(u32 j = i + 1; j < Size; ++j) {
-                    u32 t = i * 3 + j;
+                    u32 t = i * Size + j;
                     offdiag += M[t] * M[t];
                 }
             }
@@ -563,86 +601,94 @@ namespace
         return (iteration < MaxIteration);
     }
 
-    bool jacobi16(f32 M[16], f32 N[16])
-    {
-        static constexpr u32 Size = 4;
-        static constexpr u32 MaxIteration = 100;
-        ::memset(N, 0, sizeof(f32) * 9);
-        f32 cs;
-        f32 sn = 0.0f;
-        f32 offdiag = 0.0f;
-        for(u32 i = 0; i < Size; ++i) {
-            N[i * Size + i] = 1.0f;
-            u32 t = i * Size + i;
-            sn += M[t] * M[t];
-            for(u32 j = i + 1; j < Size; ++j) {
-                t = i * Size + j;
-                offdiag += M[t] * M[t];
-            }
-        } // for(u32 i
-        f32 tolerance = Epsilon * Epsilon * (sn * 0.5f + offdiag);
-        u32 iteration = 0;
-        for(; iteration < MaxIteration; ++iteration) {
-            offdiag = 0.0f;
-            for(u32 i = 0; i < Size - 1; ++i) {
-                for(u32 j = i + 1; j < Size; ++j) {
-                    u32 t = i * 3 + j;
-                    offdiag += M[t] * M[t];
-                }
-            }
-            if(offdiag < tolerance) {
-                break;
-            }
-            for(u32 i = 0; i < Size - 1; ++i) {
-                for(u32 j = i + 1; j < Size; ++j) {
-                    if(::fabsf(M[i * Size + j]) < AlmostZero) {
-                        continue;
-                    }
-                    f32 t = (M[j * Size + j] - M[i * Size + i]) / (2.0f * M[i * Size + j]);
-                    if(0.0f <= t) {
-                        t = 1.0f / (t + ::sqrtf(t * t + 1.0f));
-                    } else {
-                        t = 1.0f / (t - ::sqrtf(t * t + 1.0f));
-                    }
-                    cs = 1.0f / ::sqrtf(t * t + 1.0f);
-                    sn = t * cs;
-                    t *= M[i * Size + j];
-                    M[i * Size + i] -= t;
-                    M[j * Size + j] += t;
-                    M[i * Size + j] = 0.0f;
-                    for(u32 k = 0; k < i; ++k) {
-                        rotate(M, k, i, k, j, cs, sn);
-                    }
-                    for(u32 k = i + 1; k < j; ++k) {
-                        rotate(M, i, k, k, j, cs, sn);
-                    }
-                    for(u32 k = j + 1; k < Size; ++k) {
-                        rotate(M, i, k, j, k, cs, sn);
-                    }
-                    for(u32 k = 0; k < Size; ++k) {
-                        rotate(N, i, k, j, k, cs, sn);
-                    }
-                } // for(u32 j
-            }     // for(u32 i
-        }         // for(u32 iteration
-        return (iteration < MaxIteration);
-    }
-
-    bool PCA_RGBA(FRGBA& center, FRGBA& axis, FRGBA& minP, FRGBA& maxP, const u8 pixels[64])
+        bool PCA_RGB(FRGBA& center, FRGBA& axis, FRGBA& minP, FRGBA& maxP, const CompressionStatus& status)
 {
         FRGBA colors[16];
-        for(u32 i=0; i<64; i+=4){
-            colors[i].r_ = 1.0f/255.0f * pixels[i+0];
-            colors[i].g_ = 1.0f/255.0f * pixels[i+1];
-            colors[i].b_ = 1.0f/255.0f * pixels[i+2];
-            colors[i].a_ = 1.0f/255.0f * pixels[i+3];
+        for(u32 i=0; i<status.num_pixels_; ++i){
+            colors[i].r_ = 1.0f/255.0f * status.pixels_[i].r_;
+            colors[i].g_ = 1.0f/255.0f * status.pixels_[i].g_;
+            colors[i].b_ = 1.0f/255.0f * status.pixels_[i].b_;
+            colors[i].a_ = 1.0f;
         }
-    FRGBA average = kahan(16, colors);
-    f32 invSize = 1.0f / 16;
+
+    FRGBA average = kahan(status.num_pixels_, colors);
+    f32 invSize = 1.0f / status.num_pixels_;
+    average *= invSize;
+
+    f32 covariance[9] = {};
+    kahan_rgb(covariance, status.num_pixels_, colors, average);
+    covariance[0] *= invSize;
+    covariance[1] *= invSize;
+    covariance[2] *= invSize;
+    covariance[4] *= invSize;
+    covariance[5] *= invSize;
+    covariance[8] *= invSize;
+
+    covariance[3] = covariance[1];
+    covariance[6] = covariance[2];
+    covariance[7] = covariance[5];
+
+    f32 N[9];
+    if(!jacobi(covariance, N, 3)) {
+        return false;
+    }
+    FRGBA axises[3];
+    axises[0] = normalize({N[0], N[1], N[2], 1.0f});
+    axises[1] = normalize({N[3], N[4], N[5], 1.0f});
+    axises[2] = normalize({N[6], N[7], N[8],1.0f});
+    f32 d0 = dot(axises[0], average);
+    f32 d1 = dot(axises[1], average);
+    f32 d2 = dot(axises[2], average);
+    minP = {};
+    maxP = {};
+    for(u32 i = 0; i < status.num_pixels_; ++i) {
+        f32 dr = dot(axises[0], colors[i]) - d0;
+        f32 dg = dot(axises[1], colors[i]) - d1;
+        f32 db = dot(axises[2], colors[i]) - d2;
+        minP.r_ = (std::min)(dr, minP.r_);
+        minP.g_ = (std::min)(dg, minP.g_);
+        minP.b_ = (std::min)(db, minP.b_);
+
+        maxP.r_ = (std::max)(dr, maxP.r_);
+        maxP.g_ = (std::max)(dg, maxP.g_);
+        maxP.b_ = (std::max)(db, maxP.b_);
+    }
+    f32 half[3];
+    half[0] = (maxP.r_ - minP.r_) * 0.5f;
+    half[1] = (maxP.g_ - minP.g_) * 0.5f;
+    half[2] = (maxP.b_ - minP.b_) * 0.5f;
+    u32 maxIndex = 0;
+    for(u32 i=1; i<3; ++i){
+        if(half[maxIndex]<half[i]){
+            maxIndex = i;
+        }
+    }
+    FRGBA d = (minP + maxP) * 0.5f;
+    center = average + axises[0] * d.r_ + axises[1] * d.g_ + axises[2] * d.b_;
+    axis = axises[maxIndex];
+    minP = center - axis*half[maxIndex];
+    maxP = center + axis*half[maxIndex];
+    center.a_ = 1.0f;
+    minP.a_ = 1.0f;
+    maxP.a_ = 1.0f;
+    return true;
+}
+
+    bool PCA_RGBA(FRGBA& center, FRGBA& axis, FRGBA& minP, FRGBA& maxP, const CompressionStatus& status)
+{
+        FRGBA colors[16];
+        for(u32 i=0; i<status.num_pixels_; ++i){
+            colors[i].r_ = 1.0f/255.0f * status.pixels_[i].r_;
+            colors[i].g_ = 1.0f/255.0f * status.pixels_[i].g_;
+            colors[i].b_ = 1.0f/255.0f * status.pixels_[i].b_;
+            colors[i].a_ = 1.0f/255.0f * status.pixels_[i].a_;
+        }
+    FRGBA average = kahan(status.num_pixels_, colors);
+    f32 invSize = 1.0f / status.num_pixels_;
     average *= invSize;
 
     f32 covariance[16] = {};
-    kahan(covariance, 16, colors, average);
+    kahan_rgba(covariance, status.num_pixels_, colors, average);
     covariance[0] *= invSize;
     covariance[1] *= invSize;
     covariance[2] *= invSize;
@@ -662,7 +708,7 @@ namespace
     covariance[14] = covariance[11];
 
     f32 N[16];
-    if(!jacobi16(covariance, N)) {
+    if(!jacobi(covariance, N, 4)) {
         return false;
     }
     FRGBA axises[4];
@@ -674,9 +720,9 @@ namespace
     f32 d1 = dot(axises[1], average);
     f32 d2 = dot(axises[2], average);
     f32 d3 = dot(axises[3], average);
-    FRGBA minP = {};
-    FRGBA maxP = {};
-    for(u32 i = 0; i < 16; ++i) {
+    minP = {};
+    maxP = {};
+    for(u32 i = 0; i < status.num_pixels_; ++i) {
         f32 dr = dot(axises[0], colors[i]) - d0;
         f32 dg = dot(axises[1], colors[i]) - d1;
         f32 db = dot(axises[2], colors[i]) - d2;
@@ -706,8 +752,39 @@ namespace
     center = average + axises[0] * d.r_ + axises[1] * d.g_ + axises[2] * d.b_ + axises[3] * d.a_;
     axis = axises[maxIndex];
     minP = center - axis*half[maxIndex];
-    maxP = center - axis*half[maxIndex];
+    maxP = center + axis*half[maxIndex];
+    return true;
 }
+
+    void findMinMax(FRGBA& axis, FRGBA& minP, FRGBA& maxP, const CompressionStatus& status)
+{
+        assert(0<status.num_pixels_);
+        minP.r_ = 1.0f / 255.0f * status.pixels_[0].r_;
+        minP.g_ = 1.0f / 255.0f * status.pixels_[0].g_;
+        minP.b_ = 1.0f / 255.0f * status.pixels_[0].b_;
+        minP.a_ = 1.0f / 255.0f * status.pixels_[0].a_;
+        maxP.r_ = minP.r_;
+        maxP.g_ = minP.g_;
+        maxP.b_ = minP.b_;
+        maxP.a_ = minP.a_;
+        for(u32 i = 1; i < status.num_pixels_; ++i) {
+            FRGBA color;
+            color.r_ = 1.0f/255.0f * status.pixels_[i].r_;
+            color.g_ = 1.0f/255.0f * status.pixels_[i].g_;
+            color.b_ = 1.0f/255.0f * status.pixels_[i].b_;
+            color.a_ = 1.0f/255.0f * status.pixels_[i].a_;
+            minP.r_ = (std::min)(minP.r_, color.r_);
+            minP.g_ = (std::min)(minP.g_, color.g_);
+            minP.b_ = (std::min)(minP.b_, color.b_);
+            minP.a_ = (std::min)(minP.a_, color.a_);
+            maxP.r_ = (std::max)(maxP.r_, color.r_);
+            maxP.g_ = (std::max)(maxP.g_, color.g_);
+            maxP.b_ = (std::max)(maxP.b_, color.b_);
+            maxP.a_ = (std::max)(maxP.a_, color.a_);
+        }
+        axis = maxP-minP;
+        axis = normalize(axis);
+    }
 
     RGBA scale_color(const RGBA& c, u32 color_bits, u32 pbits)
 {
@@ -727,6 +804,117 @@ namespace
 	return result;
 }
 
+    RGBA toRGBA(f32 r, f32 g, f32 b, f32 a)
+    {
+        s32 ir = static_cast<s32>(r);
+        s32 ig = static_cast<s32>(g);
+        s32 ib = static_cast<s32>(b);
+        s32 ia = static_cast<s32>(a);
+        RGBA rgba;
+        rgba.r_ = static_cast<u8>(std::clamp(ir, 0, 255));
+        rgba.g_ = static_cast<u8>(std::clamp(ig, 0, 255));
+        rgba.b_ = static_cast<u8>(std::clamp(ib, 0, 255));
+        rgba.a_ = static_cast<u8>(std::clamp(ia, 0, 255));
+        return rgba;
+    }
+
+    void toYUV(f32& y, f32& u, f32& v, const RGBA& x)
+{
+        y = 0.2126f*x.r_ + 0.7152f*x.g_ + 0.0722f*x.b_;
+        u = -0.114572f*x.r_ - 0.385428f*x.g_ + 0.5f*x.b_;
+        v = 0.5f*x.r_ - 0.454153f*x.g_ - 0.045847f*x.b_;
+    }
+
+    u64 distance(const RGBA& x0, const RGBA& x1)
+{
+        static const f32 weights[] = {8.0f, 4.0f, 1.0f, 2.0f};
+        f32 y0,u0,v0;
+        f32 y1,u1,v1;
+        toYUV(y0, u0, v0, x0);
+        toYUV(y1, u1, v1, x1);
+        f32 dy = y0-y1;
+        f32 du = u0-u1;
+        f32 dv = v0-v1;
+        f32 da = static_cast<f32>(x1.a_) - static_cast<f32>(x0.a_);
+        f32 d = weights[0]*(dy*dy) + weights[1]*(du*du) + weights[2]*(dv*dv) + weights[3]*(da*da);
+        return static_cast<u64>(d);
+}
+
+void update_error(
+    CompressionResult& result,
+    const CompressionStatus& status,
+    const RGBA& low,
+    const RGBA& high,
+    const u8 pbits[2])
+{
+    RGBA endpoint_start;
+    RGBA endpoint_end;
+
+	if(status.has_pbits_){
+
+        u32 min_pbit;
+        u32 max_pbit;
+        if(status.share_pbits_){
+            min_pbit = max_pbit = pbits[0];
+        }else{
+            min_pbit = pbits[0];
+            max_pbit = pbits[1];
+        }
+
+		endpoint_start[0] = static_cast<u8>((low[0] << 1) | min_pbit);
+		endpoint_start[1] = static_cast<u8>((low[1] << 1) | min_pbit);
+		endpoint_start[2] = static_cast<u8>((low[2] << 1) | min_pbit);
+		endpoint_start[3] = static_cast<u8>((low[3] << 1) | min_pbit);
+
+		endpoint_end[0] = static_cast<u8>((high[0] << 1) | max_pbit);
+		endpoint_end[1] = static_cast<u8>((high[1] << 1) | max_pbit);
+		endpoint_end[2] = static_cast<u8>((high[2] << 1) | max_pbit);
+		endpoint_end[3] = static_cast<u8>((high[3] << 1) | max_pbit);
+	}else{
+        endpoint_start = low;
+        endpoint_end = high;
+    }
+
+	RGBA minColor = scale_color(endpoint_start, status.color_bits_, status.has_pbits_?1:0);
+	RGBA maxColor = scale_color(endpoint_end, status.color_bits_, status.has_pbits_?1:0);
+
+    const u8 N = 1<<status.index_bits_;
+	RGBA weightedColors[16];
+	weightedColors[0] = minColor;
+	weightedColors[N-1] = maxColor;
+
+	const u32 num_components = status.has_alpha_? 4 : 3;
+	for (u8 i = 1; i < (N - 1); ++i){
+		for (u32 j = 0; j < num_components; ++j){
+            weightedColors[i][j] = interpolate(minColor[j], maxColor[j], i, status.index_bits_);
+        }
+    }
+
+    u8 indices[16] = {};
+	u64 total_error = 0;
+    for(u32 i=0; i<status.num_pixels_; ++i){
+        u64 min_error = std::numeric_limits<u64>::max();
+        u32 min_index = 0;
+        for(u32 j=0; j<N; ++j){
+            u64 error = distance(weightedColors[j], status.pixels_[i]);
+            if(error<min_error){
+                min_error = error;
+                min_index = j;
+            }
+        }
+        total_error += min_error;
+        indices[i] = static_cast<u8>(min_index);
+    }
+
+    if(total_error<result.error_){
+        result.error_ = total_error;
+        result.low_endpoint_ = low;
+        result.high_endpoint_ = high;
+        result.pbits_[0] = pbits[0];
+        result.pbits_[1] = pbits[1];
+        ::memcpy(result.indices_, indices, status.num_pixels_);
+    }
+}
 
 void fixDegenerateEndpoints(RGBA& minColor, RGBA& maxColor, const FRGBA& low, const FRGBA& high, u32 iscale)
 {
@@ -753,362 +941,249 @@ void fixDegenerateEndpoints(RGBA& minColor, RGBA& maxColor, const FRGBA& low, co
     }
 }
 
-    u64 search_optimal_with_pbits(
-        u32 mode,
-        FRGBA minColor,
-        FRGBA maxColor,
-        u32 color_bits)
+u64 search_optimal_with_pbits(
+    CompressionResult& result,
+    const CompressionStatus& status,
+    const FRGBA& minColor,
+    const FRGBA& maxColor)
 {
-        const u32 num_components = 4;
-		const s32 iscalep = (1 << (color_bits + 1)) - 1;
+    const u32 num_components = 4;
+    const s32 iscalep = (1 << (status.color_bits_ + 1)) - 1;
+    const f32 scalep = static_cast<f32>(iscalep);
+
+    u8 best_pbits[2];
+    RGBA bestMinColor, bestMaxColor;
+
+    f32 best_err0 = std::numeric_limits<f32>::infinity();
+    f32 best_err1 = std::numeric_limits<f32>::infinity();
+
+    for(u8 p = 0; p < 2; ++p) {
+        RGBA xMinColor, xMaxColor;
+        for(u8 c = 0; c < 4; ++c) {
+            xMinColor[c] = static_cast<u8>(std::clamp(static_cast<s32>((minColor[c] * scalep - p) * 0.5f + 0.5f) * 2 + p, (s32)p, iscalep - 1 + p));
+            xMaxColor[c] = static_cast<u8>(std::clamp(static_cast<s32>((maxColor[c] * scalep - p) * 0.5f + 0.5f) * 2 + p, (s32)p, iscalep - 1 + p));
+        }
+
+        RGBA scaledLow = scale_color(xMinColor, status.color_bits_, 1);
+        RGBA scaledHigh = scale_color(xMaxColor, status.color_bits_, 1);
+
+        f32 err0 = 0.0f;
+        f32 err1 = 0.0f;
+        for(u32 i = 0; i < num_components; ++i) {
+            err0 += square(scaledLow[i] - minColor[i] * 255.0f);
+            err1 += square(scaledHigh[i] - maxColor[i] * 255.0f);
+        }
+
+        if(err0 < best_err0) {
+            best_err0 = err0;
+            best_pbits[0] = p;
+            bestMinColor[0] = xMinColor[0] >> 1;
+            bestMinColor[1] = xMinColor[1] >> 1;
+            bestMinColor[2] = xMinColor[2] >> 1;
+            bestMinColor[3] = xMinColor[3] >> 1;
+        }
+
+        if(err1 < best_err1) {
+            best_err1 = err1;
+            best_pbits[1] = p;
+            bestMaxColor[0] = xMaxColor[0] >> 1;
+            bestMaxColor[1] = xMaxColor[1] >> 1;
+            bestMaxColor[2] = xMaxColor[2] >> 1;
+            bestMaxColor[3] = xMaxColor[3] >> 1;
+        }
+    }
+
+    if(1 == status.mode_) {
+        fixDegenerateEndpoints(bestMinColor, bestMaxColor, minColor, maxColor, iscalep >> 1);
+    }
+
+    update_error(result, status, bestMinColor, bestMaxColor, best_pbits);
+
+    return result.error_;
+}
+
+u64 search_optimal_with_share_pbits(
+    CompressionResult& result,
+    const CompressionStatus& status,
+        const FRGBA& minColor,
+        const FRGBA& maxColor)
+{
+		const s32 iscalep = (1 << (status.color_bits_ + 1)) - 1;
 		const f32 scalep = static_cast<f32>(iscalep);
+
+		const u32 num_components = status.has_alpha_ ? 4 : 3;
 
 		u8 best_pbits[2];
 		RGBA bestMinColor, bestMaxColor;
 
-			float best_err0 = 1e+9;
-			float best_err1 = 1e+9;
-
-			for (s32 p = 0; p < 2; ++p)
-			{
-				RGBA xMinColor, xMaxColor;
-                for(u8 c=0; c<4; ++c){
-                    xMinColor[c] = static_cast<u8>(std::clamp(static_cast<s32>((minColor[c]*scalep - p)*0.5f + 0.5f)*2+p, p, iscalep-1+p));
-                    xMaxColor[c] = static_cast<u8>(std::clamp(static_cast<s32>((maxColor[c]*scalep - p)*0.5f + 0.5f)*2+p, p, iscalep-1+p));
-                }
-
-				RGBA scaledLow = scale_color(xMinColor, color_bits, 1);
-				RGBA scaledHigh = scale_color(xMaxColor, color_bits, 1);
-
-				f32 err0 = 0.0f;
-                f32 err1 = 0.0f;
-				for (u32 i = 0; i < num_components; ++i)
-				{
-					err0 += square(scaledLow[i] - minColor[i] * 255.0f);
-					err1 += square(scaledHigh[i] - maxColor[i] * 255.0f);
-				}
-
-				if (err0 < best_err0)
-				{
-					best_err0 = err0;
-					best_pbits[0] = p;
-					bestMinColor[0] = xMinColor[0] >> 1;
-					bestMinColor[1] = xMinColor[1] >> 1;
-					bestMinColor[2] = xMinColor[2] >> 1;
-					bestMinColor[3] = xMinColor[3] >> 1;
-				}
-
-				if (err1 < best_err1)
-				{
-					best_err1 = err1;
-					best_pbits[1] = p;
-					bestMaxColor[0] = xMaxColor[0] >> 1;
-					bestMaxColor[1] = xMaxColor[1] >> 1;
-					bestMaxColor[2] = xMaxColor[2] >> 1;
-					bestMaxColor[3] = xMaxColor[3] >> 1;
-				}
-			}
-						
-            if(1 == mode) {
-                fixDegenerateEndpoints(bestMinColor, bestMaxColor, minColor, maxColor, iscalep >> 1);
+        f32 min_error = std::numeric_limits<f32>::infinity();
+        for(u8 p = 0; p < 2; ++p) {
+            RGBA xMinColor, xMaxColor;
+            for(u8 c = 0; c < 4; ++c) {
+                xMinColor[c] = static_cast<u8>(std::clamp(static_cast<s32>((minColor[c] * scalep - p) * 0.5f + 0.5f) * 2 + p, (s32)p, iscalep - 1 + p));
+                xMaxColor[c] = static_cast<u8>(std::clamp(static_cast<s32>((maxColor[c] * scalep - p) * 0.5f + 0.5f) * 2 + p, (s32)p, iscalep - 1 + p));
             }
+            RGBA scaledLow = scale_color(xMinColor, status.color_bits_, 1);
+            RGBA scaledHigh = scale_color(xMaxColor, status.color_bits_, 1);
 
-		if ((pResults->m_best_overall_err == UINT64_MAX) || color_quad_u8_notequals(&bestMinColor, &pResults->m_low_endpoint) || color_quad_u8_notequals(&bestMaxColor, &pResults->m_high_endpoint) || (best_pbits[0] != pResults->m_pbits[0]) || (best_pbits[1] != pResults->m_pbits[1]))
-			evaluate_solution(&bestMinColor, &bestMaxColor, best_pbits, pParams, pResults);
-	return pResults->m_best_overall_err;
+            f32 error = 0.0f;
+            for(u32 i = 0; i < num_components; ++i) {
+                error += square(scaledLow[i] / 255.0f - minColor[i]) + square(scaledHigh[i] / 255.0f - maxColor[i]);
+            }
+            if(error < min_error) {
+                min_error = error;
+                best_pbits[0] = p;
+                best_pbits[1] = p;
+                for(u32 j = 0; j < 4; ++j) {
+                    bestMinColor[j] = xMinColor[j] >> 1;
+                    bestMaxColor[j] = xMaxColor[j] >> 1;
+                }
+            }
+        }
+
+        if(1 == status.mode_) {
+            fixDegenerateEndpoints(bestMinColor, bestMaxColor, minColor, maxColor, iscalep >> 1);
+        }
+        update_error(result, status, bestMinColor, bestMaxColor, best_pbits);
+        return result.error_;
 }
 
-u64 search_optimal_with_share_pbits(
-        u32 mode,
-        RGBA minColor,
-        RGBA maxColor,
-        u32 color_bits)
+u64 search_optimal(
+    CompressionResult& result,
+    const CompressionStatus& status,
+    const FRGBA& minColor,
+    const FRGBA& maxColor)
 {
-	vec4F_saturate_in_place(&xl); vec4F_saturate_in_place(&xh);
+    const s32 iscalep = (1 << (status.color_bits_ + 1)) - 1;
+    const f32 scalep = static_cast<f32>(iscalep);
 
-		const int iscalep = (1 << (pParams->m_comp_bits + 1)) - 1;
-		const float scalep = (float)iscalep;
+    RGBA xMinColor = toRGBA(minColor[0] * scalep + 0.5f, minColor[1] * scalep + 0.5f, minColor[2] * scalep + 0.5f, minColor[3] * scalep + 0.5f);
+    RGBA xMaxColor = toRGBA(maxColor[0] * scalep + 0.5f, maxColor[1] * scalep + 0.5f, maxColor[2] * scalep + 0.5f, maxColor[3] * scalep + 0.5f);
 
-		const int32_t totalComps = pParams->m_has_alpha ? 4 : 3;
-
-		uint32_t best_pbits[2];
-		color_quad_u8 bestMinColor, bestMaxColor;
-
-		if (!pParams->m_endpoints_share_pbit)
-		{
-			float best_err0 = 1e+9;
-			float best_err1 = 1e+9;
-
-			for (int p = 0; p < 2; p++)
-			{
-				color_quad_u8 xMinColor, xMaxColor;
-
-				// Notes: The pbit controls which quantization intervals are selected.
-				// total_levels=2^(comp_bits+1), where comp_bits=4 for mode 0, etc.
-				// pbit 0: v=(b*2)/(total_levels-1), pbit 1: v=(b*2+1)/(total_levels-1) where b is the component bin from [0,total_levels/2-1] and v is the [0,1] component value
-				// rearranging you get for pbit 0: b=floor(v*(total_levels-1)/2+.5)
-				// rearranging you get for pbit 1: b=floor((v*(total_levels-1)-1)/2+.5)
-				for (uint32_t c = 0; c < 4; c++)
-				{
-					xMinColor.m_c[c] = (uint8_t)(clampi(((int)((xl.m_c[c] * scalep - p) / 2.0f + .5f)) * 2 + p, p, iscalep - 1 + p));
-					xMaxColor.m_c[c] = (uint8_t)(clampi(((int)((xh.m_c[c] * scalep - p) / 2.0f + .5f)) * 2 + p, p, iscalep - 1 + p));
-				}
-
-				color_quad_u8 scaledLow = scale_color(&xMinColor, pParams);
-				color_quad_u8 scaledHigh = scale_color(&xMaxColor, pParams);
-
-				float err0 = 0, err1 = 0;
-				for (int i = 0; i < totalComps; i++)
-				{
-					err0 += squaref(scaledLow.m_c[i] - xl.m_c[i] * 255.0f);
-					err1 += squaref(scaledHigh.m_c[i] - xh.m_c[i] * 255.0f);
-				}
-
-				if (err0 < best_err0)
-				{
-					best_err0 = err0;
-					best_pbits[0] = p;
-
-					bestMinColor.m_c[0] = xMinColor.m_c[0] >> 1;
-					bestMinColor.m_c[1] = xMinColor.m_c[1] >> 1;
-					bestMinColor.m_c[2] = xMinColor.m_c[2] >> 1;
-					bestMinColor.m_c[3] = xMinColor.m_c[3] >> 1;
-				}
-
-				if (err1 < best_err1)
-				{
-					best_err1 = err1;
-					best_pbits[1] = p;
-
-					bestMaxColor.m_c[0] = xMaxColor.m_c[0] >> 1;
-					bestMaxColor.m_c[1] = xMaxColor.m_c[1] >> 1;
-					bestMaxColor.m_c[2] = xMaxColor.m_c[2] >> 1;
-					bestMaxColor.m_c[3] = xMaxColor.m_c[3] >> 1;
-				}
-			}
-		}
-		else
-		{
-			// Endpoints share pbits
-			float best_err = 1e+9;
-
-			for (int p = 0; p < 2; p++)
-			{
-				color_quad_u8 xMinColor, xMaxColor;
-				for (uint32_t c = 0; c < 4; c++)
-				{
-					xMinColor.m_c[c] = (uint8_t)(clampi(((int)((xl.m_c[c] * scalep - p) / 2.0f + .5f)) * 2 + p, p, iscalep - 1 + p));
-					xMaxColor.m_c[c] = (uint8_t)(clampi(((int)((xh.m_c[c] * scalep - p) / 2.0f + .5f)) * 2 + p, p, iscalep - 1 + p));
-				}
-
-				color_quad_u8 scaledLow = scale_color(&xMinColor, pParams);
-				color_quad_u8 scaledHigh = scale_color(&xMaxColor, pParams);
-
-				float err = 0;
-				for (int i = 0; i < totalComps; i++)
-					err += squaref((scaledLow.m_c[i] / 255.0f) - xl.m_c[i]) + squaref((scaledHigh.m_c[i] / 255.0f) - xh.m_c[i]);
-
-				if (err < best_err)
-				{
-					best_err = err;
-					best_pbits[0] = p;
-					best_pbits[1] = p;
-					for (uint32_t j = 0; j < 4; j++)
-					{
-						bestMinColor.m_c[j] = xMinColor.m_c[j] >> 1;
-						bestMaxColor.m_c[j] = xMaxColor.m_c[j] >> 1;
-					}
-				}
-			}
-		}
-						
-		fixDegenerateEndpoints(mode, &bestMinColor, &bestMaxColor, &xl, &xh, iscalep >> 1);
-
-		if ((pResults->m_best_overall_err == UINT64_MAX) || color_quad_u8_notequals(&bestMinColor, &pResults->m_low_endpoint) || color_quad_u8_notequals(&bestMaxColor, &pResults->m_high_endpoint) || (best_pbits[0] != pResults->m_pbits[0]) || (best_pbits[1] != pResults->m_pbits[1]))
-			evaluate_solution(&bestMinColor, &bestMaxColor, best_pbits, pParams, pResults);
-	return pResults->m_best_overall_err;
+    if(1 == status.mode_) {
+        fixDegenerateEndpoints(xMinColor, xMaxColor, minColor, maxColor, iscalep);
+    }
+    update_error(result, status, xMinColor, xMaxColor, result.pbits_);
+    return result.error_;
 }
 
-u64 search_optimal_pbits(
-        u32 mode,
-        RGBA minColor,
-        RGBA maxColor)
+void least_squares_endpoints_rgba(FRGBA& low, FRGBA& high, const CompressionStatus& status, const u8* indices)
 {
-	vec4F_saturate_in_place(&xl); vec4F_saturate_in_place(&xh);
+    //  w*w w(1-w)            lr = wcr
+    //  (1-w) (1-w)(1-w)      hr   (1-w)cr
+    const u16* weights;
+    switch(status.index_bits_){
+    case 2:
+        weights = aWeights2;
+        break;
+    case 3:
+        weights = aWeights3;
+        break;
+    case 4:
+        weights = aWeights4;
+        break;
+    default:
+        return;
+    }
+    f32 a[4] = {};
+    f32 br[2] = {};
+    f32 bg[2] = {};
+    f32 bb[2] = {};
+    f32 ba[2] = {};
+    for(u32 i=0; i<status.num_pixels_; ++i){
+        u32 n = indices[i];
+        f32 w = 1.0f/64.0f * weights[n];
+        f32 iw = 1.0f-w;
+        a[0] += (w*w);
+        a[1] += iw*w;
+        a[3] += iw*iw;
+        br[0] += w*status.pixels_[i].r_;
+        br[1] += iw*status.pixels_[i].r_;
+        bg[0] += w*status.pixels_[i].g_;
+        bg[1] += iw*status.pixels_[i].g_;
+        bb[0] += w*status.pixels_[i].b_;
+        bb[1] += iw*status.pixels_[i].b_;
+        ba[0] += w*status.pixels_[i].a_;
+        ba[1] += iw*status.pixels_[i].a_;
+    }
+    a[2] = a[1];
+    f32 determinant = a[0]*a[3] - a[1]*a[2];
+    if(Epsilon<std::abs(determinant)){
+        determinant = 1.0f/determinant;
+    }
+    f32 ia[4];
+    ia[0] = a[3]*determinant;
+    ia[1] = -a[1]*determinant;
+    ia[2] = -a[2]*determinant;
+    ia[3] = a[0]*determinant;
 
-	if (pParams->m_has_pbits)
-	{
-		const int iscalep = (1 << (pParams->m_comp_bits + 1)) - 1;
-		const float scalep = (float)iscalep;
+    low.r_ = (ia[0]*br[0] + ia[1]*br[1]);
+    low.g_ = (ia[0]*bg[0] + ia[1]*bg[1]);
+    low.b_ = (ia[0]*bb[0] + ia[1]*bb[1]);
+    low.a_ = (ia[0]*ba[0] + ia[1]*ba[1]);
 
-		const int32_t totalComps = pParams->m_has_alpha ? 4 : 3;
-
-		uint32_t best_pbits[2];
-		color_quad_u8 bestMinColor, bestMaxColor;
-
-		if (!pParams->m_endpoints_share_pbit)
-		{
-			float best_err0 = 1e+9;
-			float best_err1 = 1e+9;
-
-			for (int p = 0; p < 2; p++)
-			{
-				color_quad_u8 xMinColor, xMaxColor;
-
-				// Notes: The pbit controls which quantization intervals are selected.
-				// total_levels=2^(comp_bits+1), where comp_bits=4 for mode 0, etc.
-				// pbit 0: v=(b*2)/(total_levels-1), pbit 1: v=(b*2+1)/(total_levels-1) where b is the component bin from [0,total_levels/2-1] and v is the [0,1] component value
-				// rearranging you get for pbit 0: b=floor(v*(total_levels-1)/2+.5)
-				// rearranging you get for pbit 1: b=floor((v*(total_levels-1)-1)/2+.5)
-				for (uint32_t c = 0; c < 4; c++)
-				{
-					xMinColor.m_c[c] = (uint8_t)(clampi(((int)((xl.m_c[c] * scalep - p) / 2.0f + .5f)) * 2 + p, p, iscalep - 1 + p));
-					xMaxColor.m_c[c] = (uint8_t)(clampi(((int)((xh.m_c[c] * scalep - p) / 2.0f + .5f)) * 2 + p, p, iscalep - 1 + p));
-				}
-
-				color_quad_u8 scaledLow = scale_color(&xMinColor, pParams);
-				color_quad_u8 scaledHigh = scale_color(&xMaxColor, pParams);
-
-				float err0 = 0, err1 = 0;
-				for (int i = 0; i < totalComps; i++)
-				{
-					err0 += squaref(scaledLow.m_c[i] - xl.m_c[i] * 255.0f);
-					err1 += squaref(scaledHigh.m_c[i] - xh.m_c[i] * 255.0f);
-				}
-
-				if (err0 < best_err0)
-				{
-					best_err0 = err0;
-					best_pbits[0] = p;
-
-					bestMinColor.m_c[0] = xMinColor.m_c[0] >> 1;
-					bestMinColor.m_c[1] = xMinColor.m_c[1] >> 1;
-					bestMinColor.m_c[2] = xMinColor.m_c[2] >> 1;
-					bestMinColor.m_c[3] = xMinColor.m_c[3] >> 1;
-				}
-
-				if (err1 < best_err1)
-				{
-					best_err1 = err1;
-					best_pbits[1] = p;
-
-					bestMaxColor.m_c[0] = xMaxColor.m_c[0] >> 1;
-					bestMaxColor.m_c[1] = xMaxColor.m_c[1] >> 1;
-					bestMaxColor.m_c[2] = xMaxColor.m_c[2] >> 1;
-					bestMaxColor.m_c[3] = xMaxColor.m_c[3] >> 1;
-				}
-			}
-		}
-		else
-		{
-			// Endpoints share pbits
-			float best_err = 1e+9;
-
-			for (int p = 0; p < 2; p++)
-			{
-				color_quad_u8 xMinColor, xMaxColor;
-				for (uint32_t c = 0; c < 4; c++)
-				{
-					xMinColor.m_c[c] = (uint8_t)(clampi(((int)((xl.m_c[c] * scalep - p) / 2.0f + .5f)) * 2 + p, p, iscalep - 1 + p));
-					xMaxColor.m_c[c] = (uint8_t)(clampi(((int)((xh.m_c[c] * scalep - p) / 2.0f + .5f)) * 2 + p, p, iscalep - 1 + p));
-				}
-
-				color_quad_u8 scaledLow = scale_color(&xMinColor, pParams);
-				color_quad_u8 scaledHigh = scale_color(&xMaxColor, pParams);
-
-				float err = 0;
-				for (int i = 0; i < totalComps; i++)
-					err += squaref((scaledLow.m_c[i] / 255.0f) - xl.m_c[i]) + squaref((scaledHigh.m_c[i] / 255.0f) - xh.m_c[i]);
-
-				if (err < best_err)
-				{
-					best_err = err;
-					best_pbits[0] = p;
-					best_pbits[1] = p;
-					for (uint32_t j = 0; j < 4; j++)
-					{
-						bestMinColor.m_c[j] = xMinColor.m_c[j] >> 1;
-						bestMaxColor.m_c[j] = xMaxColor.m_c[j] >> 1;
-					}
-				}
-			}
-		}
-						
-		fixDegenerateEndpoints(mode, &bestMinColor, &bestMaxColor, &xl, &xh, iscalep >> 1);
-
-		if ((pResults->m_best_overall_err == UINT64_MAX) || color_quad_u8_notequals(&bestMinColor, &pResults->m_low_endpoint) || color_quad_u8_notequals(&bestMaxColor, &pResults->m_high_endpoint) || (best_pbits[0] != pResults->m_pbits[0]) || (best_pbits[1] != pResults->m_pbits[1]))
-			evaluate_solution(&bestMinColor, &bestMaxColor, best_pbits, pParams, pResults);
-	}
-	else
-	{
-		const int iscale = (1 << pParams->m_comp_bits) - 1;
-		const float scale = (float)iscale;
-
-		color_quad_u8 trialMinColor, trialMaxColor;
-		color_quad_u8_set_clamped(&trialMinColor, (int)(xl.m_c[0] * scale + .5f), (int)(xl.m_c[1] * scale + .5f), (int)(xl.m_c[2] * scale + .5f), (int)(xl.m_c[3] * scale + .5f));
-		color_quad_u8_set_clamped(&trialMaxColor, (int)(xh.m_c[0] * scale + .5f), (int)(xh.m_c[1] * scale + .5f), (int)(xh.m_c[2] * scale + .5f), (int)(xh.m_c[3] * scale + .5f));
-
-		fixDegenerateEndpoints(mode, &trialMinColor, &trialMaxColor, &xl, &xh, iscale);
-
-		if ((pResults->m_best_overall_err == UINT64_MAX) || color_quad_u8_notequals(&trialMinColor, &pResults->m_low_endpoint) || color_quad_u8_notequals(&trialMaxColor, &pResults->m_high_endpoint))
-			evaluate_solution(&trialMinColor, &trialMaxColor, pResults->m_pbits, pParams, pResults);
-	}
-
-	return pResults->m_best_overall_err;
+    high.r_ = (ia[2]*br[0] + ia[3]*br[1]);
+    high.g_ = (ia[2]*bg[0] + ia[3]*bg[1]);
+    high.b_ = (ia[2]*bb[0] + ia[3]*bb[1]);
+    high.a_ = (ia[2]*ba[0] + ia[3]*ba[1]);
 }
 
-
-    void least_squares_endpoints_rgba(
-        u32 size, const varying int *uniform pSelectors, const uniform vec4F *uniform pSelector_weights, varying vec4F *uniform pXl, varying vec4F *uniform pXh, const varying color_quad_i * uniform pColors)
+void least_squares_endpoints_rgb(FRGBA& low, FRGBA& high, const CompressionStatus& status, const u8* indices)
 {
-	// Least squares using normal equations: http://www.cs.cornell.edu/~bindel/class/cs3220-s12/notes/lec10.pdf 
-	// I did this in matrix form first, expanded out all the ops, then optimized it a bit.
-	float z00 = 0.0f, z01 = 0.0f, z10 = 0.0f, z11 = 0.0f;
-	float q00_r = 0.0f, q10_r = 0.0f, t_r = 0.0f;
-	float q00_g = 0.0f, q10_g = 0.0f, t_g = 0.0f;
-	float q00_b = 0.0f, q10_b = 0.0f, t_b = 0.0f;
-	float q00_a = 0.0f, q10_a = 0.0f, t_a = 0.0f;
-	for (uniform uint32_t i = 0; i < N; i++)
-	{
-		const uint32_t sel = pSelectors[i];
+    //  w*w w(1-w)            lr = wcr
+    //  (1-w)w (1-w)(1-w)      hr   (1-w)cr
+    const u16* weights;
+    switch(status.index_bits_){
+    case 2:
+        weights = aWeights2;
+        break;
+    case 3:
+        weights = aWeights3;
+        break;
+    case 4:
+        weights = aWeights4;
+        break;
+    default:
+        return;
+    }
+    f32 a[4] = {};
+    f32 br[2] = {};
+    f32 bg[2] = {};
+    f32 bb[2] = {};
+    for(u32 i=0; i<status.num_pixels_; ++i){
+        u32 n = indices[i];
+        f32 w = 1.0f/64.0f * weights[n];
+        f32 iw = 1.0f-w;
+        a[0] += (w*w);
+        a[1] += iw*w;
+        a[3] += iw*iw;
+        br[0] += w*status.pixels_[i].r_;
+        br[1] += iw*status.pixels_[i].r_;
+        bg[0] += w*status.pixels_[i].g_;
+        bg[1] += iw*status.pixels_[i].g_;
+        bb[0] += w*status.pixels_[i].b_;
+        bb[1] += iw*status.pixels_[i].b_;
+    }
+    a[2] = a[1];
+    f32 determinant = a[0]*a[3] - a[1]*a[2];
+    if(Epsilon<std::abs(determinant)){
+        determinant = 1.0f/determinant;
+    }
+    f32 ia[4];
+    ia[0] = a[3]*determinant;
+    ia[1] = -a[1]*determinant;
+    ia[2] = -a[2]*determinant;
+    ia[3] = a[0]*determinant;
 
-#pragma ignore warning(perf)
-		z00 += pSelector_weights[sel].m_c[0];
-#pragma ignore warning(perf)
-		z10 += pSelector_weights[sel].m_c[1];
-#pragma ignore warning(perf)
-		z11 += pSelector_weights[sel].m_c[2];
+    low.r_ = (ia[0]*br[0] + ia[1]*br[1]);
+    low.g_ = (ia[0]*bg[0] + ia[1]*bg[1]);
+    low.b_ = (ia[0]*bb[0] + ia[1]*bb[1]);
+    low.a_ = 1.0f;
 
-#pragma ignore warning(perf)
-		float w = pSelector_weights[sel].m_c[3];
-
-		q00_r += w * (int)pColors[i].m_c[0]; t_r += (int)pColors[i].m_c[0];
-		q00_g += w * (int)pColors[i].m_c[1]; t_g += (int)pColors[i].m_c[1];
-		q00_b += w * (int)pColors[i].m_c[2]; t_b += (int)pColors[i].m_c[2];
-		q00_a += w * (int)pColors[i].m_c[3]; t_a += (int)pColors[i].m_c[3];
-	}
-
-	q10_r = t_r - q00_r;
-	q10_g = t_g - q00_g;
-	q10_b = t_b - q00_b;
-	q10_a = t_a - q00_a;
-
-	z01 = z10;
-
-	float det = z00 * z11 - z01 * z10;
-	if (det != 0.0f)
-		det = 1.0f / det;
-
-	float iz00, iz01, iz10, iz11;
-	iz00 = z11 * det;
-	iz01 = -z01 * det;
-	iz10 = -z10 * det;
-	iz11 = z00 * det;
-
-	pXl->m_c[0] = (float)(iz00 * q00_r + iz01 * q10_r); pXh->m_c[0] = (float)(iz10 * q00_r + iz11 * q10_r);
-	pXl->m_c[1] = (float)(iz00 * q00_g + iz01 * q10_g); pXh->m_c[1] = (float)(iz10 * q00_g + iz11 * q10_g);
-	pXl->m_c[2] = (float)(iz00 * q00_b + iz01 * q10_b); pXh->m_c[2] = (float)(iz10 * q00_b + iz11 * q10_b);
-	pXl->m_c[3] = (float)(iz00 * q00_a + iz01 * q10_a); pXh->m_c[3] = (float)(iz10 * q00_a + iz11 * q10_a);
+    high.r_ = (ia[2]*br[0] + ia[3]*br[1]);
+    high.g_ = (ia[2]*bg[0] + ia[3]*bg[1]);
+    high.b_ = (ia[2]*bb[0] + ia[3]*bb[1]);
+    high.a_ = 1.0f;
 }
 
 	u8 extract_mode(u32 src)
@@ -1177,10 +1252,6 @@ u64 search_optimal_pbits(
         return val;
     }
 
-    const u16 aWeights2[] = {0, 21, 43, 64};
-    const u16 aWeights3[] = {0, 9, 18, 27, 37, 46, 55, 64};
-    const u16 aWeights4[] = {0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64};
-
     u8 interpolate2(u8 e0, u8 e1, u8 index)
     {
         return (u8)(((64 - aWeights2[index]) * u16(e0) + aWeights2[index] * u16(e1) + 32) >> 6);
@@ -1196,6 +1267,19 @@ u64 search_optimal_pbits(
         return (u8)(((64 - aWeights4[index]) * u16(e0) + aWeights4[index] * u16(e1) + 32) >> 6);
     }
 
+    u8 interpolate(u8 e0, u8 e1, u8 index, u8 index_bits)
+    {
+        switch(index_bits) {
+        case 2:
+            return interpolate2(e0, e1, index);
+        case 3:
+            return interpolate3(e0, e1, index);
+        case 4:
+            return interpolate4(e0, e1, index);
+        default:
+            return 0;
+        }
+    }
 
     u8 error(u8 x, u8 c)
     {
@@ -1681,7 +1765,7 @@ u64 search_optimal_pbits(
         }
         u8 color_indices[16];
         u8 alpha_indices[16];
-        const u32 weight_bits[2] = { index_mode ? 3 : 2,  index_mode ? 2 : 3 };
+        const u32 weight_bits[2] = { index_mode ? 3UL : 2UL,  index_mode ? 2UL : 3UL };
         {
             u8* c = index_mode? color_indices : alpha_indices;
             u8* a = index_mode? alpha_indices : color_indices;
@@ -1961,6 +2045,111 @@ u64 search_optimal_pbits(
 
     void bc7_encode_mode1(EncodeStats& encode, const u8 src[64])
     {
+        u8 min_partition = 0;
+        u8 endpoint_r[4];
+        u8 endpoint_g[4];
+        u8 endpoint_b[4];
+        u8 pbits[2];
+        u8 color_indices[16] = {};
+
+        CompressionStatus status;
+        status.mode_ = 1;
+        status.color_bits_ = 6;
+        status.index_bits_ = 3;
+        status.has_alpha_ = false;
+        status.has_pbits_ = true;
+        status.share_pbits_ = true;
+
+        FRGBA center, axis, low, high;
+        for(u32 sub = 0; sub < 2; ++sub) {
+            //for(u32 part = 0; part < 64; ++part) {
+            for(u32 part = 0; part < 1; ++part) {
+                const u8* partition = bc7_partitions2[part];
+                u32 count = 0;
+                for(u32 i = 0; i < 16; ++i) {
+                    u8 subset_index = partition[i];
+                    if(sub != subset_index) {
+                        continue;
+                    }
+                    u32 index = 4 * i;
+                    status.pixels_[count].r_ = src[index + 0];
+                    status.pixels_[count].g_ = src[index + 1];
+                    status.pixels_[count].b_ = src[index + 2];
+                    status.pixels_[count].a_ = src[index + 3];
+                    ++count;
+                }
+                status.num_pixels_ = count;
+                CompressionResult result = {};
+                result.error_ = std::numeric_limits<u64>::max();
+                if(!PCA_RGB(center, axis, low, high, status)) {
+                    findMinMax(axis, low, high, status);
+                }
+
+                if(search_optimal_with_share_pbits(result, status, low, high)) {
+                    least_squares_endpoints_rgb(low, high, status, result.indices_);
+                    CompressionResult result2 = {};
+                    result2.error_ = std::numeric_limits<u64>::max();
+                    search_optimal_with_share_pbits(result2, status, low, high);
+                    if(result2.error_<result.error_){
+                        result = result2;
+                    }
+                }
+                assert(result.pbits_[0] == result.pbits_[1]);
+                u32 sub_index = 2*sub;
+                endpoint_r[sub_index+0] = result.low_endpoint_.r_;
+                endpoint_g[sub_index+0] = result.low_endpoint_.g_;
+                endpoint_b[sub_index+0] = result.low_endpoint_.b_;
+                endpoint_r[sub_index+1] = result.high_endpoint_.r_;
+                endpoint_g[sub_index+1] = result.high_endpoint_.g_;
+                endpoint_b[sub_index+1] = result.high_endpoint_.b_;
+                pbits[sub] = result.pbits_[0];
+                count = 0;
+                for(u32 i = 0; i < 16; ++i) {
+                    u8 subset_index = partition[i];
+                    if(sub != subset_index) {
+                        continue;
+                    }
+                    color_indices[i] = result.indices_[count];
+                    ++count;
+                }
+
+            }
+        }
+
+        {
+            u8* dst = encode.block_;
+            ::memset(dst, 0, 16);
+            dst[0] |= 0x1UL << 1;
+            dst[0] |= (min_partition & 0x3FUL) << 2;
+            dst[1] |= (endpoint_r[0] & 0x3FUL) << 0;
+            dst[1] |= (endpoint_r[1] & 0x03UL) << 6;
+            dst[2] |= (endpoint_r[1] >> 2) & 0x0FUL;
+            dst[2] |= (endpoint_r[2] & 0x0FUL) << 4;
+            dst[3] |= (endpoint_r[2] >> 4) & 0x03UL;
+            dst[3] |= (endpoint_r[3] & 0x3FUL) << 2;
+            dst[4] |= (endpoint_g[0] & 0x3FUL) << 0;
+            dst[4] |= (endpoint_g[1] & 0x03UL) << 6;
+            dst[5] |= (endpoint_g[1] >> 2) & 0x0FUL;
+            dst[5] |= (endpoint_g[2] & 0x0FUL) << 4;
+            dst[6] |= (endpoint_g[2] >> 4) & 0x03UL;
+            dst[6] |= (endpoint_g[3] & 0x3FUL) << 2;
+            dst[7] |= (endpoint_b[0] & 0x3FUL) << 0;
+            dst[7] |= (endpoint_b[1] & 0x03UL) << 6;
+            dst[8] |= (endpoint_b[1] >> 2) & 0x0FUL;
+            dst[8] |= (endpoint_b[2] & 0x0FUL) << 4;
+            dst[9] |= (endpoint_b[2] >> 4) & 0x03UL;
+            dst[9] |= (endpoint_b[3] & 0x3FUL) << 2;
+
+            dst[10] |= pbits[0] << 0;
+            dst[10] |= pbits[1] << 1;
+
+            u32 offset = 2 + 8 * 10;
+            for(u32 i = 0; i < 16; ++i) {
+                u32 bits = (!i) || (i == bc7_anchor_index_second_subset_two[min_partition]) ? 2 : 3;
+                write_bits(offset, dst, color_indices[i], bits);
+            }
+        }
+#if 0
         u8 endpoint_r[4];
         u8 endpoint_g[4];
         u8 endpoint_b[4];
@@ -2103,6 +2292,7 @@ u64 search_optimal_pbits(
             u32 bits = (!i) || (i == bc7_anchor_index_second_subset_two[min_partition]) ? 2 : 3;
             write_bits(offset, dst, r_color_indices[i], bits);
         }
+    #endif
     }
 
     void bc7_encode_mode6(EncodeStats& encode, const u8 src[64])
