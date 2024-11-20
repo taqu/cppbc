@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <random>
 #include "cppbc.h"
 #include <lodepng.h>
 #include <bc7decomp.h>
@@ -38,13 +39,31 @@ void inject(cppbc::u8* dst, cppbc::u32 x, cppbc::u32 y, cppbc::u32 w, cppbc::u32
 	}
 }
 
-void proc(const char* file, cppbc::u32 no)
+void proc(const char* file, cppbc::u32 no, bool alpha = false)
 {
 	using namespace cppbc;
 	cppbc::u8* out = nullptr;
 	u32 width = 0;
 	u32 height = 0;
 	u32 size = lodepng_decode32_file(&out, &width, &height, file);
+
+	if(alpha){
+		std::mt19937 rand;
+        {
+			std::random_device device;
+			rand.seed(device());
+        }
+		for(u32 i=0; i<height; ++i){
+			for(u32 j=0; j<width; ++j){
+				u32 r = rand();
+				if(r&0x01UL){
+					continue;
+				}
+				u32 index = (i*width+j)*4;
+				out[index+3] = rand()&0xFFUL;
+			}
+		}
+	}
 
 	u32 wblocks = width / 4;
     u32 hblocks = height / 4;
@@ -86,9 +105,17 @@ void proc(const char* file, cppbc::u32 no)
     }
 
 	char buffer[64];
-	sprintf_s(buffer, "out1_%02d.png", no);
+	if(alpha){
+		sprintf_s(buffer, "out1_alpha_%02d.png", no);
+    }else{
+		sprintf_s(buffer, "out1_%02d.png", no);
+	}
 	lodepng_encode32_file(buffer, out2, width, height);
-	sprintf_s(buffer, "out2_%02d.png", no);
+	if(alpha){
+        sprintf_s(buffer, "out2_alpha_%02d.png", no);
+	}else{
+		sprintf_s(buffer, "out2_%02d.png", no);
+	}
 	lodepng_encode32_file(buffer, out3, width, height);
 	free(out2);
 	free(out3);
@@ -100,5 +127,10 @@ int main(void)
 	proc("data/cat00.png", 0);
 	proc("data/cat01.png", 1);
 	proc("data/cat02.png", 2);
+
+	proc("data/cat00.png", 0, true);
+	proc("data/cat01.png", 1, true);
+	proc("data/cat02.png", 2, true);
+
 	return 0;
 }
